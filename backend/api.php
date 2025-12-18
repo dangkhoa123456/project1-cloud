@@ -1,4 +1,15 @@
 <?php
+// ===== CORS HANDLING (Cho phép Frontend gọi vào) =====
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Content-Type: application/json; charset=UTF-8');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
+
 // 1. Lấy thông tin từ cấu hình Render
 $host = getenv('DB_HOST');
 $port = getenv('DB_PORT');
@@ -6,43 +17,50 @@ $user = getenv('DB_USER');
 $pass = getenv('DB_PASS');
 $dbname = getenv('DB_NAME');
 
-// 2. Kiểm tra: Nếu không có biến môi trường (tức là đang chạy ở máy local), thì dùng localhost
+// 2. Fallback cho Localhost
 if (!$host) {
     $host = 'localhost';
     $user = 'root';
     $pass = '';
-    $dbname = 'test'; // Tên DB trên máy tính của bạn
+    $dbname = 'contact_db'; // Sửa đúng tên DB local của bạn
     $port = 3306;
 }
+
 try {
-    $pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    // 3. SỬA LỖI KẾT NỐI Ở ĐÂY:
+    // - Thêm port=$port
+    // - Sửa $db thành $dbname
+    $dsn = "mysql:host=$host;port=$port;dbname=$dbname;charset=utf8mb4";
+    
+    // - Cấu hình SSL cho Aiven
+    $options = [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        // Dòng này quan trọng để chạy trên Render kết nối Aiven:
+        PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT => false, 
+    ];
+
+    $pdo = new PDO($dsn, $user, $pass, $options);
+
 } catch (PDOException $e) {
     http_response_code(500);
-    echo json_encode(['error' => 'Database connection failed']);
-    exit;
-}
-
-// ===== CORS HANDLING =====
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE');
-header('Access-Control-Allow-Headers: Content-Type');
-header('Content-Type: application/json');
-
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
+    // In lỗi chi tiết để debug (xóa dòng message khi chạy thật)
+    echo json_encode([
+        'error' => 'Database connection failed', 
+        'message' => $e->getMessage()
+    ]);
     exit;
 }
 
 // ===== ROUTING =====
 $method = $_SERVER['REQUEST_METHOD'];
-$action = $_GET['action'] ?? 'get';
+
+// Lấy action từ query param hoặc mặc định
+$action = $_GET['action'] ?? '';
 
 switch ($method) {
     case 'GET':
-        if ($action === 'get') {
-            handleGet($pdo);
-        }
+        handleGet($pdo);
         break;
     
     case 'POST':
@@ -64,28 +82,31 @@ switch ($method) {
 
 // ===== CRUD FUNCTIONS =====
 
-// GET: Lấy danh sách (search nếu có ?q=...)
 function handleGet($pdo) {
     $search = $_GET['q'] ?? '';
     
-    if ($search) {
-        $sql = "SELECT * FROM contacts WHERE name LIKE :search ORDER BY name";
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute(['search' => "%$search%"]);
-    } else {
-        $sql = "SELECT * FROM contacts ORDER BY name";
-        $stmt = $pdo->query($sql);
+    try {
+        if ($search) {
+            $sql = "SELECT * FROM contacts WHERE name LIKE :search ORDER BY id DESC";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute(['search' => "%$search%"]);
+        } else {
+            $sql = "SELECT * FROM contacts ORDER BY id DESC";
+            $stmt = $pdo->query($sql);
+        }
+        
+        $contacts = $stmt->fetchAll();
+        echo json_encode($contacts);
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(['error' => $e->getMessage()]);
     }
-    
-    $contacts = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    echo json_encode($contacts);
 }
 
-// POST: Thêm mới
 function handlePost($pdo) {
     $data = json_decode(file_get_contents('php://input'), true);
     
-    if (!isset($data['name']) || !isset($data['phone'])) {
+    if (empty($data['name']) || empty($data['phone'])) {
         http_response_code(400);
         echo json_encode(['error' => 'Name and phone required']);
         return;
@@ -102,15 +123,14 @@ function handlePost($pdo) {
         echo json_encode(['success' => true, 'id' => $pdo->lastInsertId()]);
     } catch (PDOException $e) {
         http_response_code(500);
-        echo json_encode(['error' => 'Failed to add contact']);
+        echo json_encode(['error' => 'Failed to add contact: ' . $e->getMessage()]);
     }
 }
 
-// PUT: Cập nhật
 function handlePut($pdo) {
     $data = json_decode(file_get_contents('php://input'), true);
     
-    if (!isset($data['id']) || !isset($data['name']) || !isset($data['phone'])) {
+    if (empty($data['id']) || empty($data['name']) || empty($data['phone'])) {
         http_response_code(400);
         echo json_encode(['error' => 'ID, name and phone required']);
         return;
@@ -132,9 +152,13 @@ function handlePut($pdo) {
     }
 }
 
-// DELETE: Xóa theo ID
 function handleDelete($pdo) {
+    // Hỗ trợ lấy ID từ cả URL param (?id=1) hoặc Body JSON
     $id = $_GET['id'] ?? null;
+    if (!$id) {
+        $data = json_decode(file_get_contents('php://input'), true);
+        $id = $data['id'] ?? null;
+    }
     
     if (!$id) {
         http_response_code(400);
